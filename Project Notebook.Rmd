@@ -1,0 +1,493 @@
+---
+title: "Project Notebook - Quora Duplicates"
+output:
+html_notebook: default
+html_document: default
+---
+
+
+Mentor: Prof. Soumyakanti Chakraborty
+XLRI - Xavier School of Management<br>
+<i>FOR THE GREATER GOOD</i><br>
+
+
+by Shikhar Parashar<br>
+DATA Science Using Excel and R<br>
+
+
+Abstract
+The Sole purpose of this project is to figure our with some accurracy the duplicacy of questions asked on QUORA.com using XGBoost.
+
+To acheive this, we take a functional programming approch inorder to create re-usability of code and easy of understanding for further analysis.
+
+Packages used in the Study are as follows:
+<li><u>readr</u> : The goal of 'readr' is to provide a fast and friendly way to read rectangular data (like 'csv', 'tsv', and 'fwf'). It is designed to flexibly parse many types of data found in the wild, while still cleanly failing when data unexpectedly changes.
+<li><u>dplyr</u> : dplyr provides a flexible grammar of data manipulation. It's the next iteration of plyr, focused on tools for working with data frames (hence the d in the name).
+<li><u>purrr</u> : Make your pure functions purr with the 'purrr' package. This
+package completes R's functional programming tools with missing features
+present in other programming languages.
+<li><u>stringr</u> : A consistent, simple and easy to use set of wrappers around the fantastic 'stringi' package. All function and argument names (and positions) are consistent, all functions deal with "NA"'s and zero length vectors in the same way, and the output from one function is easy to feed into the input of another.
+<li><u>xgboost</u> : Extreme Gradient Boosting, which is an efficient implementation of the gradient boosting framework from Chen & Guestrin (2016) <doi:10.1145/2939672.2939785>. This package is its R interface. The package includes efficient linear model solver and tree learning algorithms. The package can automatically do parallel computation on a single machine which could be more than 10 times faster than existing gradient boosting packages. It supports various objective functions, including regression, classification and ranking. The package is made to be extensible, so that users are also allowed to define their own objectives easily.
+<li><u>lubridate</u> : Lubridate is an R package that makes it easier to work with dates and times.
+<li><u>syuzhet</u> : The package comes with four sentiment dictionaries and provides a method for accessing the robust, but computationally expensive, sentiment extraction tool developed in the NLP group at Stanford.  Use of this later method requires that you have already installed the coreNLP package (see http://nlp.stanford.edu/software/corenlp.shtml)
+<li><u>e1071</u> : Functions for latent class analysis, short time Fourier transform, fuzzy clustering, support vector machines, shortest path computation, bagged clustering, naive Bayes classifier. 
+
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+setwd("S://DATA Science//XLRI//Project - Quora//")
+packages <- c("readr", "e1071","tm", "dtplyr",  "data.table", "purrr",  "tidytext", "dplyr", "stringr", "xgboost", "lubridate", "syuzhet")
+purrr::walk(packages, library, character.only = TRUE, warn.conflicts = FALSE)
+
+train_filename <- "train.csv"
+test_filename <- "test.csv"
+
+sample_submission_filename <- "./input/sample_submission.csv.zip"
+results_path <- "./"
+
+target_variable <- "is_duplicate"
+train_variables <- c(target_variable, "id", "qid1", "qid2", "question1", "question2")
+
+SEED <- 9999
+
+max_rows <- 1000   # set to Inf to run entire data set
+```
+
+
+Step 2 - Functions
+Functions do all the work. Let's start with some basic functions to calculate features. 
+
+```{r }
+get_feature_names <- function(train, test, train_variables = train_variables){
+  ## Get list of variables used in training
+  var_names <- intersect(names(train), names(test))
+  var_names <- setdiff(var_names, train_variables)
+  var_names
+  return(var_names)
+}
+
+cleanup <- function(string1){
+  string1 <- tolower(string1)
+  string1 <- gsub("<img src.*?>", "", string1,fixed = TRUE)
+  string1 <- gsub("http\\S+", "", string1,fixed = TRUE)
+  string1 <- gsub("\\[math\\]", "", string1,fixed = TRUE) # text between [] refers to tags e.g. [math]
+  string1 <- gsub("<.*?>", "", string1,fixed = TRUE)
+  string1 <- gsub("\n", " ", string1,fixed = TRUE)    # replace newline with a space
+  string1 <- gsub("\\s+", " ", string1,fixed = TRUE)   # multiple spaces into one
+  # using tm_map to remove stopwords
+  docs <- Corpus(VectorSource(string1))
+  docs <- tm_map(docs, removeWords, stopwords('en'))
+  docs <- tm_map(docs, removePunctuation)    # dont remove punct so early in the analysis
+  docs <- tm_map(docs, stripWhitespace)
+  xxx <- sapply(docs, function(i) i)
+  data_content <- data.frame(text = xxx, stringsAsFactors = FALSE)
+  data_content$text
+  return(data_content$text)
+}
+
+
+
+words_in_common <- function(string1, string2) {
+  vec <- str_split(c(string1[[1]],string2[[1]]), " ")
+  
+  q1_words <- unique(vec[[1]])
+  q2_words <- unique(vec[[2]])
+  qboth_words <- intersect(q1_words, q2_words)
+  qtotal_words <- unique(c(q1_words, q2_words))
+  
+  if(length(qtotal_words) > 0){
+    result <- length(qboth_words) / length(qtotal_words)
+  } else {
+    result <- 0
+  }
+  
+  return(result)
+}
+
+```
+
+Sentiment Analysis using the get_nrc_sentiment method of the syuzhet package for identifing the positive and negative polarity of the question.
+
+``` {r}
+
+sentiment_analysis <- function(string1,type="p") {
+  
+  sentiment1 <- get_nrc_sentiment(as.vector(string1))
+  if(type=="p"){
+    result = sum(sentiment1$positive)  
+  }else{
+    result = sum(sentiment1$negative)  
+  }
+  return(result)
+}  
+ 
+```
+
+The String Distance Feature is a very useful feature when it comes to figuringout the distance of seperation amongst 2 different strings. Here we use 9 different methods for the purpose of string distance calculation.
+
+
+  <b>osa</b>: Optimal string aligment, (restricted Damerau-Levenshtein distance).<br>
+  <b>lv</b>: Levenshtein distance (as in R's native adist).<br>
+  <b>dl</b>: Full Damerau-Levenshtein distance.<br>
+  <b>hamming</b>: Hamming distance (a and b must have same nr of characters).<br>
+  <b>lcs</b>: Longest common substring distance.<br>
+  <b>qgram</b>: q-gram distance.<br>
+  <b>cosine</b>: cosine distance between q-gram profiles.<br>
+  <b>jaccard</b>: Jaccard distance between q-gram profiles.<br>
+  <b>jw</b>: Jaro, or Jaro-Winker distance.<br>
+  
+  
+
+```{r}
+
+String_Distance_feature <- function(data, total_characters, method="lv"){
+  
+  strdiff <- 1 - stringdist::stringdist(tolower(data$question1),
+                                            tolower(data$question2), method = method)/total_characters
+  return(strdiff)
+}
+
+```
+
+An important function here is create_features. This feature creates numeric variables which signify the following: 
+a. Total number of matches between the 2 questions.
+b. Character Count in each question.
+c. Word density ratio.
+
+```{r}
+create_features <- function(data, train = TRUE){
+  
+  cat("Extracting features from", round(nrow(data)/1000,0), "thousand examples.\n")
+  
+  #Cleaning the data for analysis
+  #data$question1clean <- cleanup(data$question1)
+  #data$question2clean <- cleanup(data$question2)
+
+  tokens_q1 <- data %>%
+    unnest_tokens(word, question1, drop = FALSE, token = "regex", pattern = " ") %>%
+    count(id, word) %>%
+    ungroup()
+  tokens_q1 <- tokens_q1[data, on = "id"]
+  colnames(tokens_q1)[1:3] <- c("id1", "word1", "n1")
+  tokens_q1 <- tokens_q1[,c("id1", "question1", "word1", "n1"),with = FALSE]
+  # calculate tf-idf weights
+  tf.idf1 <- tokens_q1 %>% bind_tf_idf(word1, question1, n1) %>%
+                                  select(id1, question1, word1, tf, idf, tf_idf)
+  
+  ###  for question2
+  tokens_q2 <- data %>%
+    unnest_tokens(word, question2, drop = FALSE, token = "regex", pattern = " ") %>%
+    count(id, word) %>%
+    ungroup()
+  tokens_q2 <- tokens_q2[data, on = "id"]
+  colnames(tokens_q2)[1:3] <- c("id2", "word2", "n2")
+  tokens_q2 <- tokens_q2[,c("id2", "question2", "word2", "n2"),with=FALSE]
+  # calculate tf-idf weights
+  tf.idf2 <- tokens_q2 %>% bind_tf_idf(word2, question2, n2) %>%
+                           select(id2, question2, word2, tf, idf, tf_idf)
+
+  
+  ##  get the ratio of common words in both questions to the total number of unique words using the tf-idf weights to give exposure to common words
+  
+  func <- function(x){
+    id.check <- x$id1[1] == tf.idf2$id2    # boolean vector to subset the question2 for same id 
+    
+    words1 <- x$word1
+    words2 <- tf.idf2$word2[id.check]
+    common <- intersect(words1, words2)    # list of common words in both
+    uncommon.q1 <- setdiff(words1, words2) # words not present in question1
+    uncommon.q2 <- setdiff(words2, words1) # words not present in question2
+    len_common_words <- length(common)
+    
+    len_q1 <- nchar(x$question1[1])
+    len_q2 <- nchar(tf.idf2$question2[id.check][1])
+    diff_len <- abs(len_q1 - len_q2)       # difference in length of characters
+    
+    tfidf.wt1 <- x$tf_idf
+    tfidf.wt2 <- tf.idf2$tf_idf[id.check]
+    # calculate how similar both questions are based on tfidf weights
+    # positive effect for the common words and negative exposure for the uncommon words
+    w1_shared_wts <- tfidf.wt1[match(common, words1)]
+    w1_unshared_wts <- tfidf.wt1[match(uncommon.q1, words1)]
+    w2_shared_wts <- tfidf.wt2[match(common, words2)]
+    w2_unshared_wts <- tfidf.wt2[match(uncommon.q2, words2)]
+    ratio_commonality = (sum(c(w1_shared_wts,w2_shared_wts))-sum(c(w1_unshared_wts,w2_unshared_wts)))/(sum(tfidf.wt1, tfidf.wt2))
+    return(list(as.numeric(len_common_words), as.numeric(ratio_commonality), as.numeric(diff_len)))
+  }
+  
+  
+  ans = tf.idf1[ , c("len_common_words", "ratio_commonality", "diff_len") := func(.SD) , keyby = id1, .SDcols = c(colnames(tf.idf1))]
+  ans <- ans[, c("id1", "len_common_words", "ratio_commonality", "diff_len"), with = FALSE]
+  colnames(ans)[1] = "id"
+  ans <- ans[!duplicated(ans$id),]
+  ans <- data[ans, on = "id"]
+  
+  ans$is_duplicate <- factor(ans$is_duplicate)
+  #data$is_duplicate <- factor(ans$is_duplicate)
+  #ans$is_duplicate <- ans$is_duplicate
+  ans$ratio_commonality[is.na(ans$ratio_commonality)] <- min(ans$ratio_commonality, na.rm = TRUE)
+  
+  #str(ans)
+  
+  #data$len_common_words <- ifelse(ans$len_common_words > 0, as.numeric(ans$len_common_words), 0)
+  #data$ratio_commonality <- as.numeric(ans$ratio_commonality)
+  #data$diff_len <- as.numeric(ans$diff_len)
+  
+  
+  # Strings match
+  data$match <- as.numeric(tolower(data$question1) == tolower(data$question2))
+  
+  
+  # Character count
+  data$qid1ccnt <- as.numeric(nchar(data$question1))
+  data$qid2ccnt <- as.numeric(nchar(data$question2))
+  
+  total_characters <- apply(cbind(data$qid1ccnt, data$qid2ccnt), 1, max)
+  data$qcratio <- 1 - abs(data$qid1ccnt - data$qid2ccnt) / total_characters
+  
+  
+  #   Word count
+  data$qid1wcnt <- as.numeric(str_count(data$question1, "\\S+"))
+  data$qid2wcnt <- as.numeric(str_count(data$question2, "\\S+"))
+  
+  total_words <- apply(cbind(data$qid1wcnt, data$qid2wcnt), 1, max)
+  
+  data$qwratio <- 1 - abs(data$qid1wcnt - data$qid2wcnt) / total_words
+  
+  #   Matching word fraction
+  
+  data$wordscommon <- map2_dbl(data$question1, data$question2, words_in_common)
+
+  #   punctuation (?, ., [math], caps, numbers)
+  
+  data$q1qm <- as.numeric(str_count(data$question1, "\\?"))
+  data$q2qm <- as.numeric(str_count(data$question2, "\\?"))
+  data$qmatchqm <- as.numeric(data$q1qm == data$q2qm)
+  data$qratioqm <- ifelse(data$qmatchqm == 1, 1, 
+                          1 - abs(data$q1qm - data$q2qm)/(data$q1qm + data$q2qm))
+  
+  data$q1math <- as.numeric(str_count(data$question1, "\\[math]"))
+  data$q2math <- as.numeric(str_count(data$question2, "\\[math]"))
+  data$qmatchmath <- as.numeric(data$q1math == data$q2math)
+  data$qratiomath <- ifelse(data$qmatchmath == 1, 1, 
+                            1 - abs(data$q1math - data$q2math)/(data$q1math + data$q2math))
+  
+  data$q1stop <- as.numeric(str_count(data$question1, "\\."))
+  data$q2stop <- as.numeric(str_count(data$question2, "\\."))
+  data$qmatchstop <- as.numeric(data$q1stop == data$q2stop)
+  data$qratiostop <- ifelse(data$qmatchstop == 1, 1, 
+                            1 - abs(data$q1stop - data$q2stop)/(data$q1stop + data$q2stop))
+  
+  data$q1num <- as.numeric(str_count(data$question1, "\\d+"))
+  data$q2num <- as.numeric(str_count(data$question2, "\\d+"))
+  data$qmatchnum <- as.numeric(data$q1num == data$q2num)
+  data$qrationum <- ifelse(data$qmatchnum == 1, 1, 
+                           1 - abs(data$q1num - data$q2num)/(data$q1num + data$q2num))
+  
+
+  #Sentiment Analysis - Only the Positive and Negative Polarity measure.
+  
+  data$q1PScore <- map2_dbl(data$question1, "p", sentiment_analysis)
+  data$q2PScore <- map2_dbl(data$question2, "p", sentiment_analysis)
+  data$q1NScore <- map2_dbl(data$question1, "n", sentiment_analysis)
+  data$q2NScore <- map2_dbl(data$question2, "n", sentiment_analysis)
+  
+  #Just for Fun
+  
+  data$q1SentiScore <- data$q1PScore - data$q1NScore
+  data$q2SentiScore <- data$q2PScore - data$q2NScore
+
+
+  # All.Equal approach
+  #data$all_equal_score <- all.equal(data$question1,data$question2)
+  #data$all_equal_score_clean <- all.equal(data$question1,data$question2)
+  
+  
+  #String Distance - Calculate all varities for String Distances and add as a feature.
+  data$strdist_osa <- String_Distance_feature(data, total_characters, "osa")
+  data$strdist_lv <- String_Distance_feature(data, total_characters, "lv")
+  data$strdist_cosine <- String_Distance_feature(data, total_characters, "cosine")
+  data$strdist_dl <- String_Distance_feature(data, total_characters, "dl")
+  #data$strdist_hamming <- String_Distance_feature(data, total_characters, "hamming")
+  data$strdist_lcs <- String_Distance_feature(data, total_characters, "lcs")
+  data$strdist_qgram <- String_Distance_feature(data, total_characters, "qgram")
+  data$strdist_jaccard <- String_Distance_feature(data, total_characters, "jaccard")
+  data$strdist_jw <- String_Distance_feature(data, total_characters, "jw")
+  
+  
+  #str(data)  
+  
+  data$is_duplicate <- as.numeric(data$is_duplicate)
+    
+  return(data)
+}
+```
+
+Every script needs a function to actually create the prediction model. Here we use XGBoost and Navie Bayes. These two functions have been programmed such as to automatically split off a fraction of the model for training. We will pass several training variables to the model when we run it.
+
+
+```{r}
+run_xgboost_model <- function(tr, target_variable, var_names, n_rounds, 
+                              early_stop, eta, m_depth, seed, tr_frac = 0.8){
+  
+  ## Create folds
+
+  set.seed(seed)
+  idx_tr <- sample(seq(nrow(tr)), floor(tr_frac * nrow(tr)) )
+  gc()
+  
+  tr_len <- length(idx_tr)
+  vl_len <- nrow(tr) - tr_len
+  
+  cat("Training with", tr_len , "questions, validating with", vl_len ,"questions.\n")
+  
+  target <- tr[[target_variable]]
+  
+  
+  dtrain <- xgb.DMatrix(data=data.matrix(tr[idx_tr,var_names]), label=target[idx_tr], missing = NA)
+  
+  dval <- xgb.DMatrix(data=data.matrix(tr[-idx_tr,var_names]), label=target[-idx_tr])
+  
+  watchlist <- watchlist <- list(train = dtrain, eval = dval)
+
+  param <- list(  objective           = "binary:logistic", 
+                  booster             = "gbtree",
+                  eval_metric         = "logloss",
+                  eta                 = eta, 
+                  max_depth           = m_depth, 
+                  subsample           = 0.8,
+                  colsample_bytree    = 0.8,
+                  min_child_weight    = 2,
+                  maximize            = FALSE
+                  
+  )
+  
+  xgb_c <- xgb.train( params                = param, 
+                      data                  = dtrain,
+                      nrounds               = n_rounds, 
+                      verbose               = 1,
+                      print_every_n         = 10L,
+                      early_stopping_rounds = early_stop,
+                      watchlist             = watchlist
+  )
+  return(xgb_c)
+}
+```
+
+
+Applying the Naive Bayes Method of classification.
+
+```{r}
+run_NB_model <- function(tr, target_variable, var_names, seed, tr_frac = 0.8){
+  
+  set.seed(seed)
+  idx_tr <- sample(seq(nrow(tr)), floor(tr_frac * nrow(tr)) )
+  gc()
+  
+  tr_len <- length(idx_tr)
+  vl_len <- nrow(tr) - tr_len
+  
+  cat("Training with", tr_len , "questions, validating with", vl_len ,"questions.\n")
+  
+  target <- tr[[target_variable]]
+  
+  NB_model <- naiveBayes(target~.,data=tr)
+  
+  return(NB_model)
+  
+}
+
+
+```
+
+
+After building the model, this function will process the test data and create a submission file.
+
+```{r}
+create_submission_file <- function(model, te, var_names, modelName){
+
+  if(modelName == "XGB"){
+    dte <- xgb.DMatrix(data.matrix(te[var_names]), missing=NA)
+    
+    outcomes <- predict(model, dte)
+  }
+  if(modelName== "NB"){
+    outcomes <- predict(model,te)
+  }
+    
+  
+    sub_name <- paste(results_path, "submission_",model$best_score,"_", 
+                        Sys.time(),".csv", sep = "")
+    sub_name <- gsub(":", "-", sub_name)
+    sub_name <- gsub(" ", "_", sub_name)
+    #dte <- xgb.DMatrix(data.matrix(te[var_names]), missing=NA)
+    #outcomes <- predict(model, dte)
+    sub_data <- data.frame(test_id = te$test_id, is_duplicate = outcomes)
+    write_csv(sub_data, sub_name)
+    
+}
+```
+
+
+We are almost ready to run this model. This last function will read and prepare the raw data.
+
+```{r}
+read_and_prepare_data <- function(filename, train = TRUE, n_max = Inf){
+  
+  if(train){
+    colspec <- cols(
+      id = col_integer(),
+      qid1 = col_integer(),
+      qid2 = col_integer(),
+      question1 = col_character(),
+      question2 = col_character(),
+      is_duplicate = col_integer()
+    )
+  } else {
+    colspec <- cols(
+      test_id = col_integer(),
+      question1 = col_character(),
+      question2 = col_character()
+    )
+  }
+  
+  #dat <- read_csv(filename, col_types = colspec, n_max = n_max)
+  dat <- fread(filename)
+  dat <- dat[1:n_max,]
+  dat2 <- create_features(dat, train = train)
+  str(dat2)
+  return(dat2)
+  #dat2
+}
+```
+
+
+Step 3 - Build the Model and Make Predictions
+It is time to run the model. Let's see if this actually works.
+
+```{r}
+#te <- read_and_prepare_data(test_filename, train = FALSE, n_max = max_rows)
+tr <- read_and_prepare_data(train_filename, train = TRUE, n_max = max_rows)
+var_names <- get_feature_names(tr, tr, train_variables)
+head(tr)
+target_variable
+var_names
+modelXGB <- run_xgboost_model(tr, target_variable, var_names,
+                           n_rounds = 1000, 
+                           early_stop = 50, 
+                           eta = 0.2, 
+                           m_depth = 4,
+                           seed = SEED)
+
+modelNB <- run_NB_model(tr,target_variable, var_names, seed=SEED)
+
+```
+
+When the model is finished, process the test data and make your submission.
+
+```{r}
+te <- read_and_prepare_data(test_filename, train = FALSE, n_max = max_rows)
+
+#create_submission_file(modelXGB, te, var_names, "XGB")
+create_submission_file(modelNB, te, var_names, "NB")
+
+```
